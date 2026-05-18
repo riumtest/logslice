@@ -1,27 +1,25 @@
-// Package query implements the logslice query DSL for filtering structured
-// JSON log entries.
+// Package query provides a lightweight DSL for filtering structured JSON log
+// records. A filter expression takes the form:
 //
-// # Syntax
-//
-// A query is a whitespace-separated list of filter expressions. All filters
-// are ANDed together. Each filter has the form:
-//
-//	field<op>value
+//	<field> <op> <value>
 //
 // Supported operators:
 //
-//	=    equal
-//	!=   not equal
-//	>    greater than (numeric)
-//	<    less than (numeric)
-//	>=   greater than or equal (numeric)
-//	<=   less than or equal (numeric)
-//	~    contains (substring match)
+//	=   equal (string or numeric)
+//	!=  not equal
+//	>   greater than (numeric)
+//	>=  greater than or equal (numeric)
+//	<   less than (numeric)
+//	<=  less than or equal (numeric)
+//	~   contains substring (string)
 //
-// # Examples
+// Examples:
 //
-//	level=error
-//	level=error status>=500
-//	msg~timeout latency>200
+//	level = error
+//	status >= 500
+//	msg ~ timeout
 //
+// Fields are looked up in the top-level keys of the JSON object. Values are
+// always treated as strings unless the operator implies numeric comparison, in
+// which case both sides are parsed as float64.
 package query
