@@ -51,3 +51,22 @@ func TestParseEmptyFieldOrValue(t *testing.T) {
 	_, err = parseFilter("field=")
 	assert.Error(t, err)
 }
+
+func TestMatchEmptyEntry(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"eq against empty entry", "level=error"},
+		{"numeric gt against empty entry", "status>399"},
+		{"contains against empty entry", "msg~timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q, err := Parse(tt.query)
+			require.NoError(t, err)
+			assert.False(t, q.Match(map[string]any{}))
+		})
+	}
+}
