@@ -84,3 +84,17 @@ func TestMatchMissingField(t *testing.T) {
 		t.Error("expected no match for missing field")
 	}
 }
+
+// TestMatchBoundaryExclusive verifies that a timestamp exactly equal to To is
+// treated as outside the range (i.e. the upper bound is exclusive).
+func TestMatchBoundaryExclusive(t *testing.T) {
+	f := timerange.Filter{
+		From: anchor.Add(-1 * time.Hour),
+		To:   anchor,
+	}
+	// A record stamped exactly at To should not match.
+	exact := anchor.Format(time.RFC3339)
+	if f.Match(makeRecord(exact), "time") {
+		t.Error("expected no match for timestamp equal to To (upper bound should be exclusive)")
+	}
+}
