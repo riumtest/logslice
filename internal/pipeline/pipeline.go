@@ -1,82 +1,135 @@
-// Package pipeline wires together a reader, query filter, and formatter
-// into a single processing loop.
+// Package pipeline wires together the reader, filter, sampler, time-range
+// filter, formatter, and output writer into a single streaming pipeline.
 package pipeline
 
 import (
-	"errors"
+	"encoding/json"
+	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/yourorg/logslice/internal/formatter"
+	"github.com/yourorg/logslice/internal/output"
 	"github.com/yourorg/logslice/internal/query"
 	"github.com/yourorg/logslice/internal/reader"
+	"github.com/yourorg/logslice/internal/sampler"
+	"github.com/yourorg/logslice/internal/source"
+	"github.com/yourorg/logslice/internal/timerange"
 )
 
-// Config holds the settings for a pipeline run.
-type Config struct {
-	Sources    []io.Reader
-	FilterExpr string
-	Out        io.Writer
-	Format     formatter.Format
-	TimeKey    string
-	LevelKey   string
-	MessageKey string
+// Options configures a pipeline run.
+type Options struct {
+	Sources       []string
+	Stdin         io.Reader
+	Output        io.Writer
+	Format        string
+	Keys          []string
+	FilterExpr    string
+	Colorize      bool
+	SampleMode    string // "head", "tail", "rate"
+	SampleN       int
+	SampleRate    float64
+	SampleSeed    int64
+	TimeField     string
+	TimeRangeExpr string
+	TimeRangeNow  time.Time
 }
 
-// Run reads log entries from all sources, applies the optional filter, and
-// writes matching entries to the configured output. It returns the number of
-// entries written and any terminal error.
-func Run(cfg Config) (int, error) {
-	if len(cfg.Sources) == 0 {
-		return 0, errors.New("pipeline: no sources provided")
+// Run executes the pipeline, writing formatted log lines to opts.Output.
+func Run(opts Options) error {
+	srcs, err := source.New(opts.Sources, source.WithStdin(opts.Stdin))
+	if err != nil {
+		return fmt.Errorf("pipeline: %w", err)
+	}
+	defer func() {
+		for _, s := range srcs {
+			s.Close()
+		}
+	}()
+
+	var filt *query.Filter
+	if opts.FilterExpr != "" {
+		f, err := query.Parse(opts.FilterExpr)
+		if err != nil {
+			return fmt.Errorf("pipeline: bad filter: %w", err)
+		}
+		filt = f
 	}
 
-	var filter *query.Filter
-	if cfg.FilterExpr != "" {
-		var err error
-		filter, err = query.Parse(cfg.FilterExpr)
+	var trFilter timerange.Filter
+	if opts.TimeRangeExpr != "" {
+		now := opts.TimeRangeNow
+		if now.IsZero() {
+			now = time.Now()
+		}
+		trFilter, err = timerange.Parse(opts.TimeRangeExpr, now)
 		if err != nil {
-			return 0, err
+			return fmt.Errorf("pipeline: bad time range: %w", err)
 		}
 	}
 
-	fopts := []formatter.Option{formatter.WithFormat(cfg.Format)}
-	if cfg.TimeKey != "" || cfg.LevelKey != "" || cfg.MessageKey != "" {
-		tk := orDefault(cfg.TimeKey, "time")
-		lk := orDefault(cfg.LevelKey, "level")
-		mk := orDefault(cfg.MessageKey, "msg")
-		fopts = append(fopts, formatter.WithKeys(tk, lk, mk))
-	}
-	fmt := formatter.New(cfg.Out, fopts...)
-
-	r := reader.New(cfg.Sources...)
-	written := 0
-
-	for {
-		entry, raw, err := r.Next()
-		if errors.Is(err, io.EOF) {
-			break
+	var records []map[string]json.RawMessage
+	for _, src := range srcs {
+		r := reader.New(src)
+		for {
+			rec, err := r.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				continue
+			}
+			if filt != nil && !filt.Match(rec) {
+				continue
+			}
+			tf := orDefault(opts.TimeField, "time")
+			if !trFilter.IsZero() && !trFilter.Match(rec, tf) {
+				continue
+			}
+			records = append(records, rec)
 		}
+	}
+
+	if opts.SampleMode != "" {
+		var samplerOpts []sampler.Option
+		if opts.SampleSeed != 0 {
+			samplerOpts = append(samplerOpts, sampler.WithSeed(opts.SampleSeed))
+		}
+		s := sampler.New(opts.SampleMode, opts.SampleN, opts.SampleRate, samplerOpts...)
+		records = s.Sample(records)
+	}
+
+	fmt_ := orDefault(opts.Format, "text")
+	keys := opts.Keys
+	if len(keys) == 0 {
+		keys = []string{"time", "level", "msg"}
+	}
+	fmtr := formatter.New(
+		formatter.WithFormat(fmt_),
+		formatter.WithKeys(keys),
+	)
+
+	w := output.New(
+		output.WithDestination(opts.Output),
+		output.WithColorize(opts.Colorize),
+	)
+
+	for _, rec := range records {
+		line, err := fmtr.Format(rec)
 		if err != nil {
-			// skip unparseable lines
 			continue
 		}
-
-		if filter != nil && !filter.Match(entry) {
-			continue
+		if err := w.Write(strings.TrimRight(line, "\n")); err != nil {
+			return err
 		}
-
-		if werr := fmt.Write(entry, raw); werr != nil {
-			return written, werr
-		}
-		written++
 	}
-
-	return written, nil
+	return nil
 }
 
-func orDefault(s, def string) string {
-	if s == "" {
+func orDefault(v, def string) string {
+	if v == "" {
 		return def
 	}
-	return s
+	return v
 }
