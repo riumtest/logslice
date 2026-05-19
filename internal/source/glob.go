@@ -3,6 +3,7 @@ package source
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 )
 
 // ExpandGlobs expands any glob patterns in paths and returns the
@@ -29,5 +30,6 @@ func ExpandGlobs(patterns []string) ([]string, error) {
 			}
 		}
 	}
+	sort.Strings(result)
 	return result, nil
 }
