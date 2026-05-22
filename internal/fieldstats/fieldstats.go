@@ -61,6 +61,16 @@ func (c *Collector) Top(n int) []Entry {
 	return entries
 }
 
+// Percent returns the percentage of total entries that had the given value,
+// rounded to two decimal places. Returns 0 if the value was never observed
+// or if no entries have been collected.
+func (c *Collector) Percent(value string) float64 {
+	if c.total == 0 {
+		return 0
+	}
+	return float64(c.counts[value]) / float64(c.total) * 100
+}
+
 // Reset clears all accumulated counts.
 func (c *Collector) Reset() {
 	c.counts = make(map[string]int)
