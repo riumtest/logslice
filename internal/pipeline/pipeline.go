@@ -1,135 +1,161 @@
-// Package pipeline wires together the reader, filter, sampler, time-range
-// filter, formatter, and output writer into a single streaming pipeline.
 package pipeline
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
-	"time"
 
+	"github.com/yourorg/logslice/internal/fielddefault"
 	"github.com/yourorg/logslice/internal/formatter"
-	"github.com/yourorg/logslice/internal/output"
+	"github.com/yourorg/logslice/internal/levelfilter"
 	"github.com/yourorg/logslice/internal/query"
 	"github.com/yourorg/logslice/internal/reader"
 	"github.com/yourorg/logslice/internal/sampler"
-	"github.com/yourorg/logslice/internal/source"
 	"github.com/yourorg/logslice/internal/timerange"
 )
 
-// Options configures a pipeline run.
-type Options struct {
-	Sources       []string
-	Stdin         io.Reader
-	Output        io.Writer
+// Source pairs an io.Reader with a display name used in diagnostics.
+type Source struct {
+	Reader io.Reader
+	Name   string
+}
+
+// FieldDefault describes a single field-default rule for the pipeline.
+type FieldDefault struct {
+	Field string
+	Value any
+}
+
+// Config holds all pipeline configuration.
+type Config struct {
+	Sources       []Source
+	Filter        string
 	Format        string
 	Keys          []string
-	FilterExpr    string
-	Colorize      bool
-	SampleMode    string // "head", "tail", "rate"
+	Output        io.Writer
+	MinLevel      string
+	TimeRange     string
+	TimeField     string
+	SampleMode    string
 	SampleN       int
 	SampleRate    float64
 	SampleSeed    int64
-	TimeField     string
-	TimeRangeExpr string
-	TimeRangeNow  time.Time
+	FieldDefaults []FieldDefault
 }
 
-// Run executes the pipeline, writing formatted log lines to opts.Output.
-func Run(opts Options) error {
-	srcs, err := source.New(opts.Sources, source.WithStdin(opts.Stdin))
-	if err != nil {
-		return fmt.Errorf("pipeline: %w", err)
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
 	}
-	defer func() {
-		for _, s := range srcs {
-			s.Close()
-		}
-	}()
+	return s
+}
 
-	var filt *query.Filter
-	if opts.FilterExpr != "" {
-		f, err := query.Parse(opts.FilterExpr)
+// Run executes the pipeline described by cfg.
+func Run(cfg Config) error {
+	if len(cfg.Sources) == 0 {
+		return fmt.Errorf("no sources provided")
+	}
+
+	// Build optional filter.
+	var filter *query.Filter
+	if cfg.Filter != "" {
+		f, err := query.Parse(cfg.Filter)
 		if err != nil {
-			return fmt.Errorf("pipeline: bad filter: %w", err)
+			return fmt.Errorf("invalid filter: %w", err)
 		}
-		filt = f
+		filter = f
 	}
 
-	var trFilter timerange.Filter
-	if opts.TimeRangeExpr != "" {
-		now := opts.TimeRangeNow
-		if now.IsZero() {
-			now = time.Now()
-		}
-		trFilter, err = timerange.Parse(opts.TimeRangeExpr, now)
+	// Build optional level filter.
+	var lvlFilter *levelfilter.Filter
+	if cfg.MinLevel != "" {
+		lvl, err := levelfilter.ParseLevel(cfg.MinLevel)
 		if err != nil {
-			return fmt.Errorf("pipeline: bad time range: %w", err)
+			return fmt.Errorf("invalid level: %w", err)
 		}
+		lvlFilter = levelfilter.New(lvl, orDefault(cfg.TimeField, "level"))
 	}
 
-	var records []map[string]json.RawMessage
-	for _, src := range srcs {
-		r := reader.New(src)
+	// Build optional time-range filter.
+	var tr *timerange.Range
+	if cfg.TimeRange != "" {
+		r, err := timerange.Parse(cfg.TimeRange)
+		if err != nil {
+			return fmt.Errorf("invalid time range: %w", err)
+		}
+		tr = r
+	}
+
+	// Build optional sampler.
+	var samp sampler.Sampler
+	if cfg.SampleMode != "" {
+		s, err := sampler.New(
+			cfg.SampleMode,
+			cfg.SampleN,
+			cfg.SampleRate,
+			sampler.WithSeed(cfg.SampleSeed),
+		)
+		if err != nil {
+			return fmt.Errorf("invalid sampler: %w", err)
+		}
+		samp = s
+	}
+
+	// Build optional field-default transformer.
+	var defTransformer *fielddefault.Transformer
+	if len(cfg.FieldDefaults) > 0 {
+		rules := make([]fielddefault.Rule, len(cfg.FieldDefaults))
+		for i, d := range cfg.FieldDefaults {
+			rules[i] = fielddefault.Rule{Field: d.Field, Value: d.Value}
+		}
+		defTransformer = fielddefault.New(rules)
+	}
+
+	// Build formatter.
+	fopts := []formatter.Option{
+		formatter.WithFormat(orDefault(cfg.Format, "text")),
+	}
+	if len(cfg.Keys) > 0 {
+		fopts = append(fopts, formatter.WithKeys(cfg.Keys))
+	}
+	fmt := formatter.New(fopts...)
+
+	for _, src := range cfg.Sources {
+		r := reader.New(src.Reader)
 		for {
-			rec, err := r.Next()
+			entry, err := r.Next()
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
+				continue // skip malformed lines
+			}
+
+			// Apply field defaults before any filtering.
+			if defTransformer != nil {
+				entry = defTransformer.Transform(entry)
+			}
+
+			if filter != nil && !filter.Match(entry) {
 				continue
 			}
-			if filt != nil && !filt.Match(rec) {
+			if lvlFilter != nil && !lvlFilter.Allow(entry) {
 				continue
 			}
-			tf := orDefault(opts.TimeField, "time")
-			if !trFilter.IsZero() && !trFilter.Match(rec, tf) {
+			if tr != nil && !tr.Match(entry, orDefault(cfg.TimeField, "time")) {
 				continue
 			}
-			records = append(records, rec)
-		}
-	}
+			if samp != nil && !samp.Keep(entry) {
+				continue
+			}
 
-	if opts.SampleMode != "" {
-		var samplerOpts []sampler.Option
-		if opts.SampleSeed != 0 {
-			samplerOpts = append(samplerOpts, sampler.WithSeed(opts.SampleSeed))
-		}
-		s := sampler.New(opts.SampleMode, opts.SampleN, opts.SampleRate, samplerOpts...)
-		records = s.Sample(records)
-	}
-
-	fmt_ := orDefault(opts.Format, "text")
-	keys := opts.Keys
-	if len(keys) == 0 {
-		keys = []string{"time", "level", "msg"}
-	}
-	fmtr := formatter.New(
-		formatter.WithFormat(fmt_),
-		formatter.WithKeys(keys),
-	)
-
-	w := output.New(
-		output.WithDestination(opts.Output),
-		output.WithColorize(opts.Colorize),
-	)
-
-	for _, rec := range records {
-		line, err := fmtr.Format(rec)
-		if err != nil {
-			continue
-		}
-		if err := w.Write(strings.TrimRight(line, "\n")); err != nil {
-			return err
+			line, err := fmt.Format(entry)
+			if err != nil {
+				raw, _ := json.Marshal(entry)
+				line = string(raw)
+			}
+			_, _ = io.WriteString(cfg.Output, line+"\n")
 		}
 	}
 	return nil
-}
-
-func orDefault(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
 }
