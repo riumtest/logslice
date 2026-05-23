@@ -85,3 +85,19 @@ func TestLookupDoesNotMutateOriginal(t *testing.T) {
 		t.Fatal("original entry must not be mutated")
 	}
 }
+
+// TestLookupDestFieldWithDefault verifies that when a dest field is configured
+// alongside a default value, the default is written to the dest field rather
+// than the source field when the lookup key is not found.
+func TestLookupDestFieldWithDefault(t *testing.T) {
+	tr := fieldlookup.New("code", map[string]string{"200": "OK"},
+		fieldlookup.WithDestField("status_text"),
+		fieldlookup.WithDefault("UNKNOWN"))
+	out := tr.Transform(entry("code", "404"))
+	if out["code"] != "404" {
+		t.Fatalf("source field should be unchanged, got %v", out["code"])
+	}
+	if out["status_text"] != "UNKNOWN" {
+		t.Fatalf("expected UNKNOWN in status_text, got %v", out["status_text"])
+	}
+}
