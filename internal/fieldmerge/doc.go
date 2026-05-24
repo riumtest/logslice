@@ -18,6 +18,13 @@
 //   - WithSeparator — string placed between joined values (default: " ").
 //   - WithSkipMissing — when true (default) absent source fields are omitted;
 //     when false a "<missing:field>" placeholder is inserted instead.
+//   - WithOverwrite — when true (default) an existing destination field is
+//     overwritten; when false the entry is returned unchanged if the
+//     destination field already exists.
 //
+// # Behaviour
+//
+// Source field values are converted to strings via fmt.Sprintf("%v", v).
+// Empty string values are treated as present and included in the join.
 // The original entry map is never mutated.
 package fieldmerge
